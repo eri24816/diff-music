@@ -7,21 +7,27 @@ import pdb
 from torch import nn
 from dataclasses import dataclass
 
-@dataclass
-class BinDiffParams:
-    total_steps: int
-    loss_final: str
-    use_softmax: bool
-    beta_type: str
-    p_flip: bool
-    focal: float
-    aux: float
-    use_label: bool
-    guidance: float
-    channels: int
+from tqdm import tqdm
+
+
 
 class BinaryDiffusion(nn.Module):
-    def __init__(self, h: BinDiffParams, denoise_fn):
+
+    @dataclass
+    class Params:
+        total_steps: int
+        loss_final: str
+        use_softmax: bool
+        beta_type: str
+        p_flip: bool
+        aux: float
+        use_label: bool
+        guidance: float
+        channels: int
+        focal_gamma: float = 0
+        focal_alpha: float = 0.5
+
+    def __init__(self, h: Params, denoise_fn):
         super().__init__()
 
         self.num_timesteps = h.total_steps
@@ -33,7 +39,8 @@ class BinaryDiffusion(nn.Module):
 
         self.scheduler = noise_scheduler(self.num_timesteps, beta_type=h.beta_type)
         self.p_flip = h.p_flip
-        self.focal = h.focal
+        self.focal_gamma = h.focal_gamma
+        self.focal_alpha = h.focal_alpha
         self.aux = h.aux
         self.use_label = h.use_label
         self.guidance = h.guidance
@@ -71,17 +78,17 @@ class BinaryDiffusion(nn.Module):
 
 
         if self.p_flip:
-            if self.focal >= 0:
+            if self.focal_gamma > 0:
                 x_0_ = torch.logical_xor(x_0, x_t_in)*1.0
-                kl_loss = focal_loss(x_0_hat_logits, x_0_, gamma=self.focal)
-                x_0_hat_logits = x_t_in * (1 - x_0_hat_logits) + (1 - x_t_in) * x_0_hat_logits
+                kl_loss = focal_loss(x_0_hat_logits, x_0_, gamma=self.focal_gamma)
+                x_0_hat_logits = x_t_in * ( - x_0_hat_logits) + (1 - x_t_in) * x_0_hat_logits
             else:
-                x_0_hat_logits = x_t_in * (1 - x_0_hat_logits) + (1 - x_t_in) * x_0_hat_logits
+                x_0_hat_logits = x_t_in * ( - x_0_hat_logits) + (1 - x_t_in) * x_0_hat_logits
                 kl_loss = F.binary_cross_entropy_with_logits(x_0_hat_logits, x_0, reduction='none')
 
         else:
-            if self.focal >= 0:
-                kl_loss = focal_loss(x_0_hat_logits, x_0, self.focal, gamma=self.focal)
+            if self.focal_gamma > 0:
+                kl_loss = focal_loss(x_0_hat_logits, x_0, self.focal_alpha, gamma=self.focal_gamma)
             else:
                 kl_loss = F.binary_cross_entropy_with_logits(x_0_hat_logits, x_0, reduction='none')
 
@@ -142,97 +149,102 @@ class BinaryDiffusion(nn.Module):
         return stats
     
     
-    def sample(self, shape: tuple[int, int, int, int], temp=1.0, sample_steps=None, return_all=False, label=None, mask=None, guidance=None, full=False):
-        device = 'cuda'
+    def sample(self, shape: tuple[int, int, int, int], temp=1.0, sample_steps=None, return_all=False, label=None, mask=None, guidance=None, full=False, pbar=False):
+        with torch.no_grad():
+            device = 'cuda'
 
-        b = shape[0]
-        x_t = torch.bernoulli(0.5 * torch.ones(shape, device=device))
-
-        if mask is not None:
-            m = mask['mask'].unsqueeze(0)
-            latent = mask['latent'].unsqueeze(0)
-            x_t = latent * m + x_t * (1-m)
-        sampling_steps = np.array(range(1, self.num_timesteps+1))
-
-        if sample_steps is not None and sample_steps != self.num_timesteps:
-            idx = np.linspace(0.0, 1.0, sample_steps)
-            idx = np.array(idx * (self.num_timesteps-1), int)
-            sampling_steps = sampling_steps[idx]
-
-        if return_all:
-            x_all = [x_t]
-
-        if self.use_label:
-            if label is None:
-                label = torch.arange(b, device=device) * 100
-                label = label.long()
-            else:
-                label = torch.full((b,), label, device=device, dtype=torch.long)
-        
-        sampling_steps = sampling_steps[::-1]
-
-
-        for i, t in enumerate(sampling_steps):
-            t = torch.full((b,), t, device=device, dtype=torch.long)
-
-            if self.use_label:
-                x_0_logits = self._denoise_fn(x_t, label, time_steps=t-1)
-                x_0_logits = x_0_logits / temp
-                if guidance is not None:
-                    x_0_logits_uncond = self._denoise_fn(x_t, None, time_steps=t-1)
-                    x_0_logits_uncond = x_0_logits_uncond / temp
-
-                    x_0_logits = (1 + guidance) * x_0_logits - guidance * x_0_logits_uncond
-            else:
-                x_0_logits = self._denoise_fn(x_t, time_steps=t-1)
-                x_0_logits = x_0_logits / temp
-                # scale by temperature
-
-            x_0_logits = torch.sigmoid(x_0_logits)
-
-
-            if self.p_flip:
-                x_0_logits =  x_t * (1 - x_0_logits) + (1 - x_t) * x_0_logits
-
-            if not t[0].item() == 1:
-                t_p = torch.full((b,), sampling_steps[i+1], device=device, dtype=torch.long)
-                
-                x_0_logits = torch.cat([x_0_logits.unsqueeze(-1), (1-x_0_logits).unsqueeze(-1)], dim=-1) 
-                x_t_logits = torch.cat([x_t.unsqueeze(-1), (1-x_t).unsqueeze(-1)], dim=-1)
-
-
-                p_EV_qxtmin_x0 = self.scheduler(x_0_logits, t_p)
-                q_one_step = x_t_logits
-
-                for mns in range(sampling_steps[i] - sampling_steps[i+1]):
-                    q_one_step = self.scheduler.one_step(q_one_step, t - mns)
-
-                unnormed_probs = p_EV_qxtmin_x0 * q_one_step
-                unnormed_probs = unnormed_probs / unnormed_probs.sum(-1, keepdims=True)
-                unnormed_probs = unnormed_probs[...,0]
-                
-                x_tm1_logits = unnormed_probs
-                x_tm1_p = torch.bernoulli(x_tm1_logits)
-            
-            else:
-                x_0_logits = x_0_logits
-                x_tm1_p = (x_0_logits > 0.5) * 1.0
-
-            x_t = x_tm1_p
+            b = shape[0]
+            x_t = torch.bernoulli(0.5 * torch.ones(shape, device=device))
 
             if mask is not None:
                 m = mask['mask'].unsqueeze(0)
                 latent = mask['latent'].unsqueeze(0)
                 x_t = latent * m + x_t * (1-m)
+            sampling_steps = np.array(range(1, self.num_timesteps+1))
 
+            if sample_steps is not None and sample_steps != self.num_timesteps:
+                idx = np.linspace(0.0, 1.0, sample_steps)
+                idx = np.array(idx * (self.num_timesteps-1), int)
+                sampling_steps = sampling_steps[idx]
 
             if return_all:
-                x_all.append(x_t)
-        if return_all:
-            return torch.stack(x_all, 1)
-        else:
-            return x_t
-    
+                x_all = [x_t]
+
+            if self.use_label:
+                if label is None:
+                    label = torch.arange(b, device=device) * 100
+                    label = label.long()
+                else:
+                    label = torch.full((b,), label, device=device, dtype=torch.long)
+            
+            sampling_steps = sampling_steps[::-1]
+
+            if pbar:
+                interable = tqdm(sampling_steps)
+            else:
+                interable = sampling_steps
+
+            for i, t in enumerate(interable):
+                t = torch.full((b,), t, device=device, dtype=torch.long)
+
+                if self.use_label:
+                    x_0_logits = self._denoise_fn(x_t, label, time_steps=t-1)
+                    x_0_logits = x_0_logits / temp
+                    if guidance is not None:
+                        x_0_logits_uncond = self._denoise_fn(x_t, None, time_steps=t-1)
+                        x_0_logits_uncond = x_0_logits_uncond / temp
+
+                        x_0_logits = (1 + guidance) * x_0_logits - guidance * x_0_logits_uncond
+                else:
+                    x_0_logits = self._denoise_fn(x_t, time_steps=t-1)
+                    x_0_logits = x_0_logits / temp
+                    # scale by temperature
+
+                x_0_probs = torch.sigmoid(x_0_logits)
+
+
+                if self.p_flip:
+                    x_0_probs =  x_t * (1 - x_0_probs) + (1 - x_t) * x_0_probs
+
+                if not t[0].item() == 1:
+                    t_p = torch.full((b,), sampling_steps[i+1], device=device, dtype=torch.long)
+                    
+                    x_0_probs = torch.cat([x_0_probs.unsqueeze(-1), (1-x_0_probs).unsqueeze(-1)], dim=-1) 
+                    x_t_probs = torch.cat([x_t.unsqueeze(-1), (1-x_t).unsqueeze(-1)], dim=-1)
+
+
+                    p_EV_qxtmin_x0 = self.scheduler(x_0_probs, t_p)
+                    q_one_step = x_t_probs
+
+                    for mns in range(sampling_steps[i] - sampling_steps[i+1]):
+                        q_one_step = self.scheduler.one_step(q_one_step, t - mns)
+
+                    unnormed_probs = p_EV_qxtmin_x0 * q_one_step
+                    unnormed_probs = unnormed_probs / unnormed_probs.sum(-1, keepdims=True)
+                    unnormed_probs = unnormed_probs[...,0]
+                    
+                    x_tm1_logits = unnormed_probs
+                    x_tm1_p = torch.bernoulli(x_tm1_logits)
+                
+                else:
+                    x_0_logits = x_0_logits
+                    x_tm1_p = (x_0_logits > 0.5) * 1.0
+
+                x_t = x_tm1_p
+
+                if mask is not None:
+                    m = mask['mask'].unsqueeze(0)
+                    latent = mask['latent'].unsqueeze(0)
+                    x_t = latent * m + x_t * (1-m)
+
+
+                if return_all:
+                    x_all.append(x_t)
+            if return_all:
+                return torch.stack(x_all, 1)
+            else:
+                return x_t
+        
     def forward(self, x, label=None, x_t=None):
         return self._train_loss(x, label, x_t)
 
@@ -342,11 +354,11 @@ class noise_scheduler(nn.Module):
         return out
     
 
-def focal_loss(inputs, targets, alpha=-1, gamma=1):
+def focal_loss(inputs:torch.Tensor, targets:torch.Tensor, alpha:float=-1, gamma:float=1):
     p = torch.sigmoid(inputs)
     ce_loss = F.binary_cross_entropy_with_logits(inputs, targets, reduction="none")
-    p_t = p * targets + (1 - p) * (1 - targets)
-    p_t = (1 - p_t)
+    p_t = p * targets + (1 - p) * (1 - targets) # tp and tn
+    p_t = (1 - p_t) # fp and fn
     p_t = p_t.clamp(min=1e-6, max=(1-1e-6)) # numerical safety
     loss = ce_loss * (p_t ** gamma)
     if alpha == -1:
