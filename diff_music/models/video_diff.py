@@ -3,19 +3,20 @@ import torch.nn as nn
 import torch
 from dataclasses import dataclass
 
-from .transformer import binary_and_one_hot_encoding
-from .attention import create_attention_blocks
+from .transformer import binary_positional_encoding
+from .attention import create_attention_blocks, create_local_attention_blocks
 
 class VideoDiffusion(nn.Module):
     @dataclass
     class Params:
         dim: int = 256
-        max_length: int = 512
+        max_length: int = 256
         depth: int = 1
         heads: int = 8
         attn_type: str = 'vanilla'
         rotary_pos_emb: bool = True
         frames_per_bar: int = 32
+        local_attn_window_size: int = 96
 
     def __init__(self, params: Params, in_channels: int):
         
@@ -24,20 +25,19 @@ class VideoDiffusion(nn.Module):
             self.depth = params.depth
             self.frames_per_bar = params.frames_per_bar
             self.num_features = params.dim
-            self.register_buffer('pe', binary_and_one_hot_encoding(length=params.max_length, dim=params.dim).unsqueeze(0)) # (b=1, t, f)
+            self.register_buffer('pe', binary_positional_encoding(length=params.max_length, dim=params.dim).unsqueeze(0)) # (b=1, t, f)
 
             self.in_layer = nn.Linear(in_channels*88 + 1, params.dim)
 
             self.frame_attn_blocks = nn.ModuleList()
             for _ in range(params.depth):
                 self.frame_attn_blocks.append(
-                    create_attention_blocks(
+                    create_local_attention_blocks(
                         dim = params.dim,
                         heads = params.heads,
+                        window_size = params.local_attn_window_size,
                         depth = 1,
-                        attn_type = params.attn_type,
-                        max_length = params.max_length,
-                        rotary_pos_emb = params.rotary_pos_emb,
+                        residual = True
                     )
                 )
 
@@ -51,6 +51,7 @@ class VideoDiffusion(nn.Module):
                         attn_type = params.attn_type,
                         max_length = params.max_length,
                         rotary_pos_emb = params.rotary_pos_emb,
+                        residual = True
                     )
                 )
 
@@ -70,9 +71,10 @@ class VideoDiffusion(nn.Module):
         x = torch.cat([x, time_steps.unsqueeze(-1).unsqueeze(-1).expand(-1, x.shape[1], -1)], dim=-1)
         x = self.in_layer(x)
 
+        x = x + self.pe[:, :x.shape[1]]
+
         x = einops.rearrange(x, 'batch (bar frame) features -> (batch bar) frame features', frame=frame_dim_size, batch=batch_size, features=self.num_features)
 
-        x = x + self.pe[:, :x.shape[1]]
         for i in range(self.depth):
             x = self.frame_attn_blocks[i](x) # (batch, bar) frame features
             x = einops.rearrange(x, '(batch bar) frame features -> (batch frame) bar features', frame=frame_dim_size, batch=batch_size, features=self.num_features)
