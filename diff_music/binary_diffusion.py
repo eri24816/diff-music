@@ -234,7 +234,6 @@ class BinaryDiffusion(nn.Module):
                     x_tm1_pred = (x_0_logits > 0) * 1.0
                     # x_tm1_probs = torch.sigmoid(x_0_logits)
                     # x_tm1_pred = torch.bernoulli(x_tm1_probs)
-                    print('x0_logits', x_0_logits.min(), x_0_logits.max())
 
                 # if (t[0].item()-1) % 10 == 0 or t[0].item() < 5:
 
@@ -341,6 +340,20 @@ class NoiseScheduler(nn.Module):
                 k_final.append(k_final[-1]*(1-beta[i]))
                 b_final.append((1-beta[i]) * b_final[-1] + gamma * beta[i])
 
+            k_final = k_final[1:]
+            b_final = b_final[1:]
+
+        elif beta_type == 'clip_linear':
+        
+            beta = np.clip(1 / (1*steps - np.arange(1, steps+1) + 1), 0, 0.3)
+        
+            k_final = [1.0]
+            b_final = [0.0]
+        
+            for i in range(steps):
+                k_final.append(k_final[-1]*(1-beta[i]))
+                b_final.append((1-beta[i]) * b_final[-1] + gamma * beta[i])
+        
             k_final = k_final[1:]
             b_final = b_final[1:]
 

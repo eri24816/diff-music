@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from .transformer import binary_positional_encoding
 from .attention import create_attention_blocks, create_local_attention_blocks
 
-class VideoDiffusion(nn.Module):
+class PianorollTransformer(nn.Module):
     @dataclass
     class Params:
         dim: int = 256
@@ -37,7 +37,8 @@ class VideoDiffusion(nn.Module):
                         heads = params.heads,
                         window_size = params.local_attn_window_size,
                         depth = 1,
-                        causal = False
+                        residual = True,
+                        causal = True
                     )
                 )
 
@@ -46,12 +47,13 @@ class VideoDiffusion(nn.Module):
                 self.bar_attn_blocks.append(
                     create_attention_blocks(
                         dim = params.dim,
-                        heads = params.heads,
                         depth = 1,
+                        heads = params.heads,
                         attn_type = params.attn_type,
                         max_length = params.max_length,
                         rotary_pos_emb = params.rotary_pos_emb,
-                        causal = False
+                        residual = True,
+                        causal = True
                     )
                 )
 

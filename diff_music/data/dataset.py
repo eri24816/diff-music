@@ -19,7 +19,7 @@ class SegmentIndexer:
 
 class PianorollDataset(Dataset):
     def __init__(self, dataset_path: Path, frames_per_beat: int = 8, hop_length: int = 32, length: int = 32*8):
-        self.ds = music_data_analysis.Dataset(dataset_path, 'synced_midi')
+        self.ds = music_data_analysis.Dataset(dataset_path)
         self.frames_per_beat = frames_per_beat
         self.hop_length = hop_length
         self.length = length
