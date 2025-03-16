@@ -74,7 +74,7 @@ def one_hot_positional_encoding(length: int, dim: int):
     '''
     return torch.eye(dim, dim).repeat(max((length+1)//dim,1),1)[:length]
 
-def append_to_right(x: torch.Tensor, value: torch.Tensor|int|float|list[int|float], dim: int = -1):
+def cat_to_right(x: torch.Tensor, value: torch.Tensor|int|float|list[int|float], dim: int = -1):
     '''
     x: (1, ..., 1, length, d1, d2,...)
     value: (d1, d2,...)
@@ -93,7 +93,7 @@ def append_to_right(x: torch.Tensor, value: torch.Tensor|int|float|list[int|floa
 
     return torch.cat([x, value], dim=dim)
 
-def nucleus_sample(logits: torch.Tensor, p: float):
+def nucleus_sample(logits: torch.Tensor, p: float) -> torch.Tensor:
     """
     logits: (classes)
     p: float close to 1
@@ -117,6 +117,20 @@ def nucleus_sample(logits: torch.Tensor, p: float):
     return selected_indices[selected]
 
 
+class MLP(nn.Module):
+    def __init__(self, in_dim: int, hidden_dim: int, out_dim: int, num_hidden_layers: int):
+        super().__init__()
+        layers = []
+        layers.append(nn.Linear(in_dim, hidden_dim))
+        for _ in range(num_hidden_layers):
+            layers.append(nn.GELU())
+            layers.append(nn.Linear(hidden_dim, hidden_dim))
+        layers.append(nn.Linear(hidden_dim, out_dim))
+        self.layers = nn.Sequential(*layers)
+
+    def forward(self, x: torch.Tensor):
+        return self.layers(x)
+    
 class MidiLikeTransformer(nn.Module):
     '''
     Autoregressive decoder
@@ -138,8 +152,10 @@ class MidiLikeTransformer(nn.Module):
     class Loss:
         token_type_loss: Tensor
         pitch_loss: Tensor
+        velocity_loss: Tensor
         total_loss: Tensor
         pitch_acc: float
+        velocity_acc: float
         token_type_acc: float
 
     def __init__(self, params: Params):
@@ -156,6 +172,8 @@ class MidiLikeTransformer(nn.Module):
         )
         self.token_type_classifier = nn.Linear(params.hidden_dim, 2)
         self.pitch_classifier = nn.Linear(params.hidden_dim, self.num_pitch)
+        self.out_pitch_emb = nn.Embedding(self.num_pitch, params.hidden_dim)
+        self.velocity_classifier = MLP(params.hidden_dim, 256, 128, 0)
 
         sinusoidal_pe = sinusoidal_positional_encoding(params.max_len, params.hidden_dim-5-32)
         binary_pe = binary_positional_encoding(params.max_len, 5)
@@ -198,29 +216,48 @@ class MidiLikeTransformer(nn.Module):
         is_frame = token_type == self.FRAME
         is_note = token_type == self.NOTE
 
+        pitch = token[:,:,0]
+        velocity = token[:,:,1]
+
         feature = self.forward(token, token_type, pos)
         
         token_type_logits = self.token_type_classifier(feature) # (batch_size, num_tokens, 2)
         pitch_logits = self.pitch_classifier(feature) # (batch_size, num_tokens, vocab_size)
+        velocity_logits = self.velocity_classifier(feature + self.out_pitch_emb(pitch)) # (batch_size, num_tokens, 128)
 
         assert token_type_logits.shape == (B, feature.shape[1], 2)
         assert pitch_logits.shape == (B, feature.shape[1], self.num_pitch)
+        assert velocity_logits.shape == (B, feature.shape[1], 128)
 
-
-        # shift the logits and tokens by 1
+        # discard the last output
         token_type_logits = token_type_logits[:,:-1]
         pitch_logits = pitch_logits[:,:-1]
+        velocity_logits = velocity_logits[:,:-1]
+
+        # shift ground truth left by 1
         token_type = token_type[:,1:]
-        token = token[:,1:]
+        pitch = pitch[:,1:]
+        velocity = velocity[:,1:]
         is_note = is_note[:,1:]
 
         token_type_loss = torch.nn.functional.cross_entropy(token_type_logits.transpose(1, 2), token_type, ignore_index=-1, reduction="mean")
-        pitch_loss = (torch.nn.functional.cross_entropy(pitch_logits.transpose(1, 2), token[:,:,0], ignore_index=-1, reduction="none") * is_note).mean()
-        total_loss = token_type_loss + pitch_loss
+        pitch_loss = (torch.nn.functional.cross_entropy(pitch_logits.transpose(1, 2), pitch, ignore_index=-1, reduction="none") * is_note).mean()
+        velocity_loss = (torch.nn.functional.cross_entropy(velocity_logits.transpose(1, 2), velocity, ignore_index=-1, reduction="none", label_smoothing=0.05) * is_note).mean()
+        total_loss = token_type_loss + pitch_loss + velocity_loss
 
         token_type_acc = (token_type_logits.detach().argmax(dim=2) == token_type).float().mean().item()
-        pitch_acc = ((pitch_logits.detach().argmax(dim=2) == token[:,:,0]) * is_note).float().mean().item()
-        return MidiLikeTransformer.Loss(token_type_loss=token_type_loss, pitch_loss=pitch_loss, total_loss=total_loss, pitch_acc=pitch_acc, token_type_acc=token_type_acc)
+        pitch_acc = ((pitch_logits.detach().argmax(dim=2) == pitch) * is_note).float().mean().item()
+        velocity_acc = ((velocity_logits.detach().argmax(dim=2) == velocity) * is_note).float().mean().item()
+
+        return MidiLikeTransformer.Loss(
+            total_loss=total_loss,
+            token_type_loss=token_type_loss,
+            pitch_loss=pitch_loss,
+            velocity_loss=velocity_loss,
+            token_type_acc=token_type_acc,
+            pitch_acc=pitch_acc,
+            velocity_acc=velocity_acc,
+        )
 
     def sample(self, length: int, max_iter: int|None=None):
         '''
@@ -236,9 +273,9 @@ class MidiLikeTransformer(nn.Module):
         pos_seq = torch.zeros(1, 0, dtype=torch.long, device=self.device) # (b=1, length)
 
         # add the first token, which is a frame
-        token_type_seq = append_to_right(token_type_seq, self.FRAME, dim=1)
-        token_seq = append_to_right(token_seq, [0,0], dim=1)
-        pos_seq = append_to_right(pos_seq, 0, dim=1)
+        token_type_seq = cat_to_right(token_type_seq, self.FRAME, dim=1)
+        token_seq = cat_to_right(token_seq, [0,0], dim=1)
+        pos_seq = cat_to_right(pos_seq, 0, dim=1)
 
         current_pos = 0
 
@@ -251,9 +288,9 @@ class MidiLikeTransformer(nn.Module):
             if token_type_pred == self.FRAME: # frame
                 current_pos += 1
 
-                token_type_seq = append_to_right(token_type_seq, self.FRAME, dim=1)
-                token_seq = append_to_right(token_seq, [0,0], dim=1)
-                pos_seq = append_to_right(pos_seq, current_pos, dim=1)
+                token_type_seq = cat_to_right(token_type_seq, self.FRAME, dim=1)
+                token_seq = cat_to_right(token_seq, [0,0], dim=1)
+                pos_seq = cat_to_right(pos_seq, current_pos, dim=1)
 
                 pbar.update(1)
 
@@ -265,9 +302,13 @@ class MidiLikeTransformer(nn.Module):
                 pitch_logits = self.pitch_classifier(feature[:, -1, :])[0] # (class)
                 pitch_pred = nucleus_sample(pitch_logits, 0.95) # scalar
 
-                token_type_seq = append_to_right(token_type_seq, self.NOTE, dim=1)
-                token_seq = append_to_right(token_seq, [pitch_pred, 100], dim=1)
-                pos_seq = append_to_right(pos_seq, current_pos, dim=1)
+                # sample velocity
+                velocity_logits = self.velocity_classifier(feature[:, -1, :] + self.out_pitch_emb(pitch_pred.unsqueeze(0)))[0] # (class)
+                velocity_pred = nucleus_sample(velocity_logits, 0.95) # scalar
+
+                token_type_seq = cat_to_right(token_type_seq, self.NOTE, dim=1)
+                token_seq = cat_to_right(token_seq, [pitch_pred.item(), velocity_pred.item()], dim=1)
+                pos_seq = cat_to_right(pos_seq, current_pos, dim=1)
             else:
                 raise ValueError(f"What is this token type: {token_type_pred}")
 
@@ -283,20 +324,21 @@ class MidiLikeTransformer(nn.Module):
         notes: list[Note] = []
         token_type_seq, token_seq, pos_seq = [x[0] for x in self.sample(length)] # (length), (length, data_dim), (length)
 
-        for i in range(token_type_seq.shape[0]):
-            if token_type_seq[i] == self.NOTE:
-                time = pos_seq[i].item()
-                pitch = token_seq[i, 0].item()
-                velocity = token_seq[i, 1].item()
-                assert isinstance(time, int)
-                assert isinstance(pitch, int)
-                assert isinstance(velocity, int)
-                notes.append(Note(onset=time, pitch=pitch+self.pitch_range[0], velocity=velocity))
+        with torch.no_grad():
+            for i in range(token_type_seq.shape[0]):
+                if token_type_seq[i] == self.NOTE:
+                    time = pos_seq[i].item()
+                    pitch = token_seq[i, 0].item()
+                    velocity = token_seq[i, 1].item()
+                    assert isinstance(time, int)
+                    assert isinstance(pitch, int)
+                    assert isinstance(velocity, int)
+                    notes.append(Note(onset=time, pitch=pitch+self.pitch_range[0], velocity=velocity))
 
         return Pianoroll(notes)
 
 
-def tokenize(pr: Pianoroll, length: int|None=None, pitch_range: list[int]=[21, 109]):
+def tokenize(pr: Pianoroll, max_length: int|None=None, pitch_range: list[int]=[21, 109], pad: bool=False):
     '''
     token type:
         -1: pad
@@ -320,14 +362,21 @@ def tokenize(pr: Pianoroll, length: int|None=None, pitch_range: list[int]=[21, 1
         token_types.append(1)
         pos.append(note.onset)
 
-    if length is not None and length > len(tokens):
-        for _ in range(length - len(tokens)):
+    if pad and max_length is not None and max_length > len(tokens):
+        for _ in range(max_length - len(tokens)):
             tokens.append([0,0])
             token_types.append(-1)
             pos.append(current_frame)
-    tokens = torch.tensor(tokens[:length])
-    token_types = torch.tensor(token_types[:length])
-    pos = torch.tensor(pos[:length])
+
+    if max_length is not None and len(tokens) > max_length:
+        print(f"Truncating the input from {len(tokens)} to {max_length}")
+        tokens = tokens[:max_length]
+        token_types = token_types[:max_length]
+        pos = pos[:max_length]
+
+    tokens = torch.tensor(tokens)
+    token_types = torch.tensor(token_types)
+    pos = torch.tensor(pos)
 
     return tokens, token_types, pos
 
@@ -342,12 +391,12 @@ def pad_and_stack(batch: list[Tensor], pad_dim: int, pad_value: float=0, stack_d
         target_length = max(x.shape[pad_dim] for x in batch)
     return torch.stack([pad_to_length(x, target_length, pad_dim, pad_value) for x in batch], stack_dim)
 
-def collate_fn(batch: list[Pianoroll]):
+def collate_fn(batch: list[Pianoroll], max_tokens: int|None=None):
     tokens_batch = []
     token_types_batch = []
     pos_batch = []
     for pr in batch:
-        tokens, token_types, pos = tokenize(pr)
+        tokens, token_types, pos = tokenize(pr, max_length=max_tokens)
         tokens_batch.append(tokens)
         token_types_batch.append(token_types)
         pos_batch.append(pos)
