@@ -166,6 +166,7 @@ class MidiLikeTransformer(nn.Module):
         self.num_pitch = params.pitch_range[1] - params.pitch_range[0]
         self.frame_emb = nn.Embedding(1, params.hidden_dim)
         self.pitch_emb = nn.Embedding(self.num_pitch, params.hidden_dim)
+        self.velocity_emb = nn.Embedding(128, params.hidden_dim)
         self.transformer = nn.TransformerEncoder(
             nn.TransformerEncoderLayer(params.hidden_dim, nhead=8, batch_first=True),
             num_layers=params.num_layers,
@@ -200,11 +201,13 @@ class MidiLikeTransformer(nn.Module):
         is_frame = token_type == self.FRAME
         is_note = token_type == self.NOTE
 
+        pitch = token[:,:,0]
+        velocity = token[:,:,1]
+
         pe = self.pe[pos] # (batch_size, num_tokens, hidden_dim)
 
-        x = is_note.unsqueeze(-1) * self.pitch_emb(token[:,:,0]) # (batch_size, num_tokens, hidden_dim)
+        x = is_note.unsqueeze(-1) * (self.pitch_emb(pitch) + self.velocity_emb(velocity)) # (batch_size, num_tokens, hidden_dim)
         x = x + is_frame.unsqueeze(-1) * self.frame_emb(torch.zeros_like(token[:,:,0])) # (batch_size, num_tokens, hidden_dim)
-
         x = x + pe # (batch_size, num_tokens, hidden_dim)
         x = self.transformer.forward(x, nn.Transformer.generate_square_subsequent_mask(x.shape[1]).to(x.device), is_causal=True) # (batch_size, num_tokens, hidden_dim)
 
@@ -221,18 +224,16 @@ class MidiLikeTransformer(nn.Module):
 
         feature = self.forward(token, token_type, pos)
         
-        token_type_logits = self.token_type_classifier(feature) # (batch_size, num_tokens, 2)
-        pitch_logits = self.pitch_classifier(feature) # (batch_size, num_tokens, vocab_size)
-        velocity_logits = self.velocity_classifier(feature + self.out_pitch_emb(pitch)) # (batch_size, num_tokens, 128)
+        token_type_logits = self.token_type_classifier(feature[:,:-1]) # (batch_size, num_tokens-1, 2)
+        pitch_logits = self.pitch_classifier(feature[:,:-1]) # (batch_size, num_tokens-1, vocab_size)
 
-        assert token_type_logits.shape == (B, feature.shape[1], 2)
-        assert pitch_logits.shape == (B, feature.shape[1], self.num_pitch)
-        assert velocity_logits.shape == (B, feature.shape[1], 128)
+        # velocity classifier can see ground truth pitch
+        velocity_logits = self.velocity_classifier(feature[:,:-1] + self.out_pitch_emb(pitch[:,1:])) # (batch_size, num_tokens-1, 128)
 
-        # discard the last output
-        token_type_logits = token_type_logits[:,:-1]
-        pitch_logits = pitch_logits[:,:-1]
-        velocity_logits = velocity_logits[:,:-1]
+        assert token_type_logits.shape == (B, feature.shape[1]-1, 2)
+        assert pitch_logits.shape == (B, feature.shape[1]-1, self.num_pitch)
+        assert velocity_logits.shape == (B, feature.shape[1]-1, 128)
+
 
         # shift ground truth left by 1
         token_type = token_type[:,1:]

@@ -25,8 +25,12 @@ def log_midi_as_audio(midi: MidiFile, name: str, step: int, save_dir: Path = Pat
     midi_path = save_dir / f"{name}_{step:08}.mid"
     midi.dump(str(midi_path))
 
-    audio_path = save_dir / f"{name}_{step:08}.wav"
-    run_command(f"fluidsynth -F \"{audio_path}\" \"{soundfont_path}\" \"{midi_path}\"")
-    audio = wandb.Audio(str(audio_path), caption=f"{name} {step}")
+    wav_path = save_dir / f"{name}_{step:08}.wav"
+    mp3_path = save_dir / f"{name}_{step:08}.mp3"
+    run_command(f"fluidsynth -F \"{wav_path}\" \"{soundfont_path}\" \"{midi_path}\"")
+    run_command(f"ffmpeg -y -i \"{wav_path}\" -b:a 192k \"{mp3_path}\"")
+    # delete the wav file
+    wav_path.unlink()
+    audio = wandb.Audio(str(mp3_path), caption=f"{name} {step}")
     wandb.log({name: audio}, step=step)
     return audio
