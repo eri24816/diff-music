@@ -42,12 +42,14 @@ class PianorollDataset(Dataset):
 
         midi = self.songs[song_idx].read_midi('synced_midi')
         pr = music_data_analysis.Pianoroll.from_midi(midi, frames_per_beat=self.frames_per_beat)
+        pr = pr.slice(segment_idx * self.hop_length, segment_idx * self.hop_length + self.length)
 
-        start_time = segment_idx * self.hop_length  
-        end_time = start_time + self.length
-        result = pr.to_tensor(binary=True, start_time=start_time, end_time=end_time)
-        if result.shape[0] != self.length:
-            print(f'warning:length mismatch: {result.shape[1]} != {self.length} {self.songs[song_idx].song_name}')
-            result = result[:self.length]
-            result = torch.cat([result, torch.zeros(self.length - result.shape[0], result.shape[1])], dim=0)
-        return result
+        return pr
+        # start_time = segment_idx * self.hop_length  
+        # end_time = start_time + self.length
+        # result = pr.to_tensor(binary=True, start_time=start_time, end_time=end_time)
+        # if result.shape[0] != self.length:
+        #     print(f'warning:length mismatch: {result.shape[1]} != {self.length} {self.songs[song_idx].song_name}')
+        #     result = result[:self.length]
+        #     result = torch.cat([result, torch.zeros(self.length - result.shape[0], result.shape[1])], dim=0)
+        # return result
