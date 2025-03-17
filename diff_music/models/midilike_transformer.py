@@ -6,43 +6,6 @@ import math
 from torch import Tensor
 from tqdm import tqdm
 
-class Tokenizer:
-    def __init__(self,n_pitch: int):
-        '''
-        Tokenize a patch into a sequence of tokens
-
-        Example:
-          Pitch(60), Velocity(100)
-          Frame
-          Pitch(64), Velocity(100)
-          Pitch(67), Velocity(100)
-          Frame
-        '''
-    def tokenize(self, pr: Pianoroll):
-        '''
-        pr: Pianoroll
-        '''
-        tokens: list[dict|str] = []
-        current_frame = -1
-        for note in pr.notes:
-            if note.onset > current_frame:
-                tokens.append("frame")
-                current_frame = note.onset
-            tokens.append({"type": "pitch", "value": note.pitch})
-        return tokens
-
-    # def tokenize(self, pr: torch.Tensor):
-    #     '''
-    #     pr: (patch_height(pitch), patch_width(time))
-    #     '''
-    #     tokens: list[dict|str] = []
-    #     onsets = pr.nonzero(as_tuple=False)
-    #     onsets = onsets[onsets[:, 1].argsort()] # sort by time
-    #     for i in range(onsets.shape[0]):
-    #         tokens.append({"type": "time", "value": onsets[i, 1].item()})
-    #         tokens.append({"type": "pitch", "value": onsets[i, 0].item()})
-
-    #     return tokens
 
 def sinusoidal_positional_encoding(length, dim):
     '''
@@ -188,12 +151,12 @@ class MidiLikeTransformer(nn.Module):
         super().to(device)
         self.device = device
 
-    def forward(self, token: torch.Tensor, token_type: torch.Tensor, pos: torch.Tensor):
+    def forward(self, token: torch.Tensor, token_type: torch.Tensor, pos: torch.Tensor, condition: torch.Tensor|None=None):
         '''
         token: (batch_size, num_tokens, data_dim)
         token_type: (batch_size, num_tokens), -1: pad, 0: frame, 1: note
         pos: (batch_size, num_tokens)
-
+        condition: (batch_size, num_tokens, hidden_dim)
         returns features extracted from the input. Used for downstream classification.
         return shape: (batch_size, num_tokens, hidden_dim)
         '''
@@ -363,6 +326,18 @@ def tokenize(pr: Pianoroll, max_length: int|None=None, pitch_range: list[int]=[2
         token_types.append(1)
         pos.append(note.onset)
 
+    for current_frame in range(current_frame+1, pr.duration+1):
+        tokens.append([0,0])
+        token_types.append(0)
+
+        # this is a special case that logically the last pos should equal to duration  
+        # but in practice this may break the model's embedding module, so it's set to 0
+        # it's okay to do this because this entry doesn't affect the model's output
+        if current_frame == pr.duration: 
+            current_frame = 0
+            
+        pos.append(current_frame)
+
     if pad and max_length is not None and max_length > len(tokens):
         for _ in range(max_length - len(tokens)):
             tokens.append([0,0])
@@ -402,7 +377,7 @@ def collate_fn(batch: list[Pianoroll], max_tokens: int|None=None):
         token_types_batch.append(token_types)
         pos_batch.append(pos)
     tokens_batch = pad_and_stack(tokens_batch, 0)
-    token_types_batch = pad_and_stack(token_types_batch, 0)
+    token_types_batch = pad_and_stack(token_types_batch, 0, pad_value=-1)
     pos_batch = pad_and_stack(pos_batch, 0)
     
     return tokens_batch, token_types_batch, pos_batch
