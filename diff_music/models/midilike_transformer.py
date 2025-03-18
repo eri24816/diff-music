@@ -2,59 +2,15 @@ from dataclasses import dataclass
 from music_data_analysis import Note, Pianoroll
 import torch
 import torch.nn as nn
-import math
 from torch import Tensor
 from tqdm import tqdm
 
+from diff_music.models.util import pad_and_stack
 
-def sinusoidal_positional_encoding(length, dim):
-    '''
-    Returns (length, dim)
-    '''
-    pe = torch.zeros(length, dim)
-    n_effective_dim = dim - dim % 2
-    position = torch.arange(0, length, dtype=torch.float).unsqueeze(1)
-    div_term = torch.exp(torch.arange(0, n_effective_dim, 2).float() * (-math.log(10000.0) / n_effective_dim))
-    pe[:, 0:n_effective_dim:2] = torch.sin(position * div_term)
-    pe[:, 1:n_effective_dim:2] = torch.cos(position * div_term)
-    return pe
+from .feature_extractor import FeatureExtractor
 
-def binary_positional_encoding(length: int, dim: int):
-    '''
-    Returns (length, dim)
-    '''
-    res = []
-    for i in range(length):
-        res.append([int(x) for x in f"{i:0{dim}b}"][-dim:])
-        # pad
-        res[-1] += [0] * (dim - len(res[-1]))
-
-    return torch.tensor(res, dtype=torch.float32).flip(dims=[1])
-
-def one_hot_positional_encoding(length: int, dim: int):
-    '''
-    Returns (length, dim)
-    '''
-    return torch.eye(dim, dim).repeat(max((length+1)//dim,1),1)[:length]
-
-def cat_to_right(x: torch.Tensor, value: torch.Tensor|int|float|list[int|float], dim: int = -1):
-    '''
-    x: (1, ..., 1, length, d1, d2,...)
-    value: (d1, d2,...)
-    dim: int
-    '''
-    if not isinstance(value, torch.Tensor):
-        value = torch.tensor(value, dtype=x.dtype, device=x.device)
-
-    if dim < 0:
-        dim = x.ndim + dim
-
-    assert x.shape[dim+1:] == value.shape, f"expected value.shape == {x.shape[dim+1:]} but got {value.shape}"
-    n_unsqueeze = x.ndim - value.ndim
-    for _ in range(n_unsqueeze):
-        value = value.unsqueeze(0)
-
-    return torch.cat([x, value], dim=dim)
+from .pe import sinusoidal_positional_encoding, binary_positional_encoding, one_hot_positional_encoding
+from .representation import SymbolicRepresentation
 
 def nucleus_sample(logits: torch.Tensor, p: float) -> torch.Tensor:
     """
@@ -127,13 +83,13 @@ class MidiLikeTransformer(nn.Module):
         self.num_layers = params.num_layers
         self.pitch_range = params.pitch_range
         self.num_pitch = params.pitch_range[1] - params.pitch_range[0]
-        self.frame_emb = nn.Embedding(1, params.hidden_dim)
-        self.pitch_emb = nn.Embedding(self.num_pitch, params.hidden_dim)
-        self.velocity_emb = nn.Embedding(128, params.hidden_dim)
-        self.transformer = nn.TransformerEncoder(
-            nn.TransformerEncoderLayer(params.hidden_dim, nhead=8, batch_first=True),
+        self.feature_extractor = FeatureExtractor(FeatureExtractor.Params(
+            dim=params.hidden_dim,
             num_layers=params.num_layers,
-        )
+            pitch_range=params.pitch_range,
+            max_len=params.max_len,
+            reduce=False,
+        ))
         self.token_type_classifier = nn.Linear(params.hidden_dim, 2)
         self.pitch_classifier = nn.Linear(params.hidden_dim, self.num_pitch)
         self.out_pitch_emb = nn.Embedding(self.num_pitch, params.hidden_dim)
@@ -151,67 +107,38 @@ class MidiLikeTransformer(nn.Module):
         super().to(device)
         self.device = device
 
-    def forward(self, token: torch.Tensor, token_type: torch.Tensor, pos: torch.Tensor, condition: torch.Tensor|None=None):
-        '''
-        token: (batch_size, num_tokens, data_dim)
-        token_type: (batch_size, num_tokens), -1: pad, 0: frame, 1: note
-        pos: (batch_size, num_tokens)
-        condition: (batch_size, num_tokens, hidden_dim)
-        returns features extracted from the input. Used for downstream classification.
-        return shape: (batch_size, num_tokens, hidden_dim)
-        '''
+    def forward(self, x: SymbolicRepresentation, prompt: SymbolicRepresentation|None=None, condition: torch.Tensor|None=None) -> Loss:
 
-        is_frame = token_type == self.FRAME
-        is_note = token_type == self.NOTE
+        if prompt is not None:
+            feature_extractor_input = prompt + x[:,:-1]
+        else:
+            feature_extractor_input = x[:,:-1]
 
-        pitch = token[:,:,0]
-        velocity = token[:,:,1]
+        feature = self.feature_extractor(feature_extractor_input, condition) # (batch_size, num_tokens-1, hidden_dim)
 
-        pe = self.pe[pos] # (batch_size, num_tokens, hidden_dim)
+        if prompt is not None:
+            feature = feature[:, prompt.length:]
 
-        x = is_note.unsqueeze(-1) * (self.pitch_emb(pitch) + self.velocity_emb(velocity)) # (batch_size, num_tokens, hidden_dim)
-        x = x + is_frame.unsqueeze(-1) * self.frame_emb(torch.zeros_like(token[:,:,0])) # (batch_size, num_tokens, hidden_dim)
-        x = x + pe # (batch_size, num_tokens, hidden_dim)
-        x = self.transformer.forward(x, nn.Transformer.generate_square_subsequent_mask(x.shape[1]).to(x.device), is_causal=True) # (batch_size, num_tokens, hidden_dim)
-
-        return x
-
-    def calculate_loss(self, token: torch.Tensor, token_type: torch.Tensor, pos: torch.Tensor) -> Loss:
-        B = token.shape[0]
-
-        is_frame = token_type == self.FRAME
-        is_note = token_type == self.NOTE
-
-        pitch = token[:,:,0]
-        velocity = token[:,:,1]
-
-        feature = self.forward(token, token_type, pos)
+        target = x[:,1:] # (batch_size, num_tokens-1)
         
-        token_type_logits = self.token_type_classifier(feature[:,:-1]) # (batch_size, num_tokens-1, 2)
-        pitch_logits = self.pitch_classifier(feature[:,:-1]) # (batch_size, num_tokens-1, vocab_size)
+        token_type_logits = self.token_type_classifier(feature) # (batch_size, num_tokens-1, 2)
+        pitch_logits = self.pitch_classifier(feature) # (batch_size, num_tokens-1, vocab_size)
 
         # velocity classifier can see ground truth pitch
-        velocity_logits = self.velocity_classifier(feature[:,:-1] + self.out_pitch_emb(pitch[:,1:])) # (batch_size, num_tokens-1, 128)
+        velocity_logits = self.velocity_classifier(feature + self.out_pitch_emb(target.pitch)) # (batch_size, num_tokens-1, 128)
 
-        assert token_type_logits.shape == (B, feature.shape[1]-1, 2)
-        assert pitch_logits.shape == (B, feature.shape[1]-1, self.num_pitch)
-        assert velocity_logits.shape == (B, feature.shape[1]-1, 128)
+        assert token_type_logits.shape == target.token_type.shape
+        assert pitch_logits.shape == target.pitch.shape
+        assert velocity_logits.shape == target.velocity.shape
 
-
-        # shift ground truth left by 1
-        token_type = token_type[:,1:]
-        pitch = pitch[:,1:]
-        velocity = velocity[:,1:]
-        is_note = is_note[:,1:]
-
-        token_type_loss = torch.nn.functional.cross_entropy(token_type_logits.transpose(1, 2), token_type, ignore_index=-1, reduction="mean")
-        pitch_loss = (torch.nn.functional.cross_entropy(pitch_logits.transpose(1, 2), pitch, ignore_index=-1, reduction="none") * is_note).mean()
-        velocity_loss = (torch.nn.functional.cross_entropy(velocity_logits.transpose(1, 2), velocity, ignore_index=-1, reduction="none", label_smoothing=0.05) * is_note).mean()
+        token_type_loss = torch.nn.functional.cross_entropy(token_type_logits.transpose(1, 2), target.token_type, ignore_index=-1, reduction="mean")
+        pitch_loss = (torch.nn.functional.cross_entropy(pitch_logits.transpose(1, 2), target.pitch, ignore_index=-1, reduction="none") * target.is_note).mean()
+        velocity_loss = (torch.nn.functional.cross_entropy(velocity_logits.transpose(1, 2), target.velocity, ignore_index=-1, reduction="none", label_smoothing=0.05) * target.is_note).mean()
         total_loss = token_type_loss + pitch_loss + velocity_loss
 
-        token_type_acc = (token_type_logits.detach().argmax(dim=2) == token_type).float().mean().item()
-        pitch_acc = ((pitch_logits.detach().argmax(dim=2) == pitch) * is_note).float().mean().item()
-        velocity_acc = ((velocity_logits.detach().argmax(dim=2) == velocity) * is_note).float().mean().item()
+        token_type_acc = (token_type_logits.detach().argmax(dim=2) == target.token_type).mean().item()
+        pitch_acc = ((pitch_logits.detach().argmax(dim=2) == target.pitch) * target.is_note).mean().item()
+        velocity_acc = ((velocity_logits.detach().argmax(dim=2) == target.velocity) * target.is_note).mean().item()
 
         return MidiLikeTransformer.Loss(
             total_loss=total_loss,
@@ -232,29 +159,20 @@ class MidiLikeTransformer(nn.Module):
         if max_iter is None:
             max_iter = length * 5
 
-        token_type_seq = torch.zeros(1, 0, dtype=torch.long, device=self.device) # (b=1, length)
-        token_seq = torch.zeros(1, 0, 2, dtype=torch.long, device=self.device) # (b=1, length, data_dim)
-        pos_seq = torch.zeros(1, 0, dtype=torch.long, device=self.device) # (b=1, length)
-
-        # add the first token, which is a frame
-        token_type_seq = cat_to_right(token_type_seq, self.FRAME, dim=1)
-        token_seq = cat_to_right(token_seq, [0,0], dim=1)
-        pos_seq = cat_to_right(pos_seq, 0, dim=1)
+        output = SymbolicRepresentation(device=self.device)
 
         current_pos = 0
 
         pbar = tqdm(range(length))
         for i in range(max_iter):
-            feature = self.forward(token_seq, token_type_seq, pos_seq) # (b=1, length, hidden_dim)
+            feature = self.feature_extractor(output) # (b=1, length, hidden_dim)
             token_type_logits = self.token_type_classifier(feature[:, -1, :])[0] # (class)
             token_type_pred = nucleus_sample(token_type_logits, 0.95) # scalar
             
             if token_type_pred == self.FRAME: # frame
                 current_pos += 1
 
-                token_type_seq = cat_to_right(token_type_seq, self.FRAME, dim=1)
-                token_seq = cat_to_right(token_seq, [0,0], dim=1)
-                pos_seq = cat_to_right(pos_seq, current_pos, dim=1)
+                output.add_frame()
 
                 pbar.update(1)
 
@@ -270,30 +188,29 @@ class MidiLikeTransformer(nn.Module):
                 velocity_logits = self.velocity_classifier(feature[:, -1, :] + self.out_pitch_emb(pitch_pred.unsqueeze(0)))[0] # (class)
                 velocity_pred = nucleus_sample(velocity_logits, 0.95) # scalar
 
-                token_type_seq = cat_to_right(token_type_seq, self.NOTE, dim=1)
-                token_seq = cat_to_right(token_seq, [pitch_pred.item(), velocity_pred.item()], dim=1)
-                pos_seq = cat_to_right(pos_seq, current_pos, dim=1)
+                output.add_note(pitch_pred, velocity_pred)
+
             else:
                 raise ValueError(f"What is this token type: {token_type_pred}")
 
-        return token_type_seq, token_seq, pos_seq
+        return output
 
 
-    def sample_midi(self, length: int) -> Pianoroll:
+    def sample_pianoroll(self, length: int) -> Pianoroll:
         '''
         length: number of frames
         frame_rate: frames per second
         return: pretty_midi.PrettyMIDI
         '''
         notes: list[Note] = []
-        token_type_seq, token_seq, pos_seq = [x[0] for x in self.sample(length)] # (length), (length, data_dim), (length)
+        result = self.sample(length)
 
         with torch.no_grad():
-            for i in range(token_type_seq.shape[0]):
-                if token_type_seq[i] == self.NOTE:
-                    time = pos_seq[i].item()
-                    pitch = token_seq[i, 0].item()
-                    velocity = token_seq[i, 1].item()
+            for i in range(result.token_type.shape[0]):
+                if result.token_type[i] == self.NOTE:
+                    time = result.pos[i].item()
+                    pitch = result.token[i, 0].item()
+                    velocity = result.token[i, 1].item()
                     assert isinstance(time, int)
                     assert isinstance(pitch, int)
                     assert isinstance(velocity, int)
@@ -357,17 +274,7 @@ def tokenize(pr: Pianoroll, max_length: int|None=None, pitch_range: list[int]=[2
     return tokens, token_types, pos
 
 
-def pad_to_length(x: Tensor, target_length: int, dim: int, pad_value: float):
-    padding_shape = list(x.shape)
-    padding_shape[dim] = target_length - x.shape[dim]
-    return torch.cat([x, torch.full(padding_shape, pad_value)])
-
-def pad_and_stack(batch: list[Tensor], pad_dim: int, pad_value: float=0, stack_dim: int=0, target_length: int|None=None) -> Tensor:
-    if target_length is None:
-        target_length = max(x.shape[pad_dim] for x in batch)
-    return torch.stack([pad_to_length(x, target_length, pad_dim, pad_value) for x in batch], stack_dim)
-
-def collate_fn(batch: list[Pianoroll], max_tokens: int|None=None):
+def collate_fn(batch: list[Pianoroll], max_tokens: int|None=None) -> SymbolicRepresentation:
     tokens_batch = []
     token_types_batch = []
     pos_batch = []
@@ -380,4 +287,4 @@ def collate_fn(batch: list[Pianoroll], max_tokens: int|None=None):
     token_types_batch = pad_and_stack(token_types_batch, 0, pad_value=-1)
     pos_batch = pad_and_stack(pos_batch, 0)
     
-    return tokens_batch, token_types_batch, pos_batch
+    return SymbolicRepresentation(tokens_batch, token_types_batch, pos_batch)
