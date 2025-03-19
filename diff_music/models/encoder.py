@@ -9,7 +9,7 @@ class VaeBottleneck(nn.Module):
     @dataclass
     class Params:
         beta: float
-        hidden_dim: int
+        dim: int
 
     def __init__(self, params: Params):
         super().__init__()
@@ -32,6 +32,7 @@ class EncoderDecoder(nn.Module):
     @dataclass
     class EncoderParams(FeatureExtractor.Params):
         max_len: int|None = None # will be set by EncoderDecoder
+        reduce: bool = True
 
     @dataclass
     class DecoderParams(MidiLikeTransformer.Params):
@@ -66,10 +67,11 @@ class EncoderDecoder(nn.Module):
     def forward(self, target: SymbolicRepresentation, prompt: SymbolicRepresentation):
         # first, encode target
 
-        target_embed = self.encoder(target)
+        # target's pos starts at prompt.max_pos+1, but for the encoder, it should start at 0
+        encoder_input = target.clone().shift_pos(-(prompt.max_pos+1))
+        target_embed = self.encoder(encoder_input)
         latent = self.bottleneck(target_embed)
 
         # then, predict target
-        loss = self.decoder.forward(prompt, latent)
-
+        loss = self.decoder.forward(x=target, prompt=prompt, condition=latent)
         return loss

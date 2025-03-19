@@ -126,11 +126,11 @@ class FeatureExtractor(nn.Module):
         if self.reduce:
             src_key_padding_mask = cat_to_right(src_key_padding_mask, False, dim=1)
 
+        # convert False and True to 0 and -inf.
         src_key_padding_mask_ = torch.zeros_like(src_key_padding_mask, dtype=x.dtype, device=x.device)
         src_key_padding_mask_[~src_key_padding_mask] = float('-inf')
-        print(src_key_padding_mask_)
 
-        x = self.transformer(x, mask=attn_mask, src_key_padding_mask=src_key_padding_mask_, is_causal=self.is_causal) # (batch_size, num_tokens, hidden_dim)
+        x = self.transformer(x, mask=attn_mask, src_key_padding_mask=src_key_padding_mask_, is_causal=self.is_causal) # (batch_size, num_tokens, dim)
 
         if self.reduce:
             # get the last token

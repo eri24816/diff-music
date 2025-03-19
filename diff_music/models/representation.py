@@ -71,7 +71,7 @@ class SymbolicRepresentation:
     
     @property
     def max_pos(self):
-        return self.pos.max()
+        return int(self.pos.max().item())
     
     @property
     def batch_size(self):
@@ -119,4 +119,10 @@ class SymbolicRepresentation:
         self.token_type = cat_to_right(self.token_type, self.PAD, dim=1)
         return self
     
+    def clone(self):
+        return SymbolicRepresentation(self.token.clone(), self.token_type.clone(), self.pos.clone())
+    
+    def shift_pos(self, shift: int):
+        self.pos = self.pos + shift * ~self.is_pad
+        return self
 

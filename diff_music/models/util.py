@@ -13,8 +13,8 @@ def pad_and_stack(batch: list[Tensor], pad_dim: int, pad_value: float=0, stack_d
 
 def cat_to_right(x: torch.Tensor, value: torch.Tensor|int|float|list[int|float|Tensor]|torch.nn.Parameter, dim: int = -1):
     '''
-    x: (1, ..., 1, length, d1, d2,...)
-    value: (d1, d2,...)
+    x: (1, ..., 1, length, d1:n)
+    value: (..., d1:n)
     dim: int
     '''
     if not isinstance(value, torch.Tensor):
@@ -23,9 +23,14 @@ def cat_to_right(x: torch.Tensor, value: torch.Tensor|int|float|list[int|float|T
     if dim < 0:
         dim = x.ndim + dim
 
-    assert x.shape[dim+1:] == value.shape, f"expected value.shape == {x.shape[dim+1:]} but got {value.shape}"
+    n = x.ndim - dim
+    assert x.shape[x.ndim-n+1:] == value.shape[value.ndim-n+1:], f'shape mismatch, x: {x.shape}, value: {value.shape}'
     n_unsqueeze = x.ndim - value.ndim
     for _ in range(n_unsqueeze):
         value = value.unsqueeze(0)
+
+    expand_shape = list(x.shape)
+    expand_shape[dim] = -1
+    value = value.expand(expand_shape)
 
     return torch.cat([x, value], dim=dim)

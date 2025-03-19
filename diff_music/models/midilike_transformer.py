@@ -1,4 +1,5 @@
 from dataclasses import dataclass
+from typing import Sequence
 from music_data_analysis import Note, Pianoroll
 import torch
 import torch.nn as nn
@@ -37,14 +38,14 @@ def nucleus_sample(logits: torch.Tensor, p: float) -> torch.Tensor:
 
 
 class MLP(nn.Module):
-    def __init__(self, in_dim: int, hidden_dim: int, out_dim: int, num_hidden_layers: int):
+    def __init__(self, in_dim: int, dim: int, out_dim: int, num_hidden_layers: int):
         super().__init__()
         layers = []
-        layers.append(nn.Linear(in_dim, hidden_dim))
+        layers.append(nn.Linear(in_dim, dim))
         for _ in range(num_hidden_layers):
             layers.append(nn.GELU())
-            layers.append(nn.Linear(hidden_dim, hidden_dim))
-        layers.append(nn.Linear(hidden_dim, out_dim))
+            layers.append(nn.Linear(dim, dim))
+        layers.append(nn.Linear(dim, out_dim))
         self.layers = nn.Sequential(*layers)
 
     def forward(self, x: torch.Tensor):
@@ -62,7 +63,7 @@ class MidiLikeTransformer(nn.Module):
 
     @dataclass
     class Params:
-        hidden_dim: int
+        dim: int
         num_layers: int
         pitch_range: list[int]
         max_len: int
@@ -79,27 +80,27 @@ class MidiLikeTransformer(nn.Module):
 
     def __init__(self, params: Params):
         super().__init__()
-        self.hidden_dim = params.hidden_dim
+        self.dim = params.dim
         self.num_layers = params.num_layers
         self.pitch_range = params.pitch_range
         self.num_pitch = params.pitch_range[1] - params.pitch_range[0]
         self.feature_extractor = FeatureExtractor(FeatureExtractor.Params(
-            dim=params.hidden_dim,
+            dim=params.dim,
             num_layers=params.num_layers,
             pitch_range=params.pitch_range,
             max_len=params.max_len,
             reduce=False,
         ))
-        self.token_type_classifier = nn.Linear(params.hidden_dim, 2)
-        self.pitch_classifier = nn.Linear(params.hidden_dim, self.num_pitch)
-        self.out_pitch_emb = nn.Embedding(self.num_pitch, params.hidden_dim)
-        self.velocity_classifier = MLP(params.hidden_dim, 256, 128, 0)
+        self.token_type_classifier = nn.Linear(params.dim, 2)
+        self.pitch_classifier = nn.Linear(params.dim, self.num_pitch)
+        self.out_pitch_emb = nn.Embedding(self.num_pitch, params.dim)
+        self.velocity_classifier = MLP(params.dim, 256, 128, 0)
 
-        sinusoidal_pe = sinusoidal_positional_encoding(params.max_len, params.hidden_dim-5-32)
+        sinusoidal_pe = sinusoidal_positional_encoding(params.max_len, params.dim-5-32)
         binary_pe = binary_positional_encoding(params.max_len, 5)
         one_hot_pe = one_hot_positional_encoding(params.max_len, 32)
 
-        pe = torch.cat([binary_pe, one_hot_pe, sinusoidal_pe], dim=1) # (max_len, hidden_dim)
+        pe = torch.cat([binary_pe, one_hot_pe, sinusoidal_pe], dim=1) # (max_len, dim)
         self.pe: torch.Tensor
         self.register_buffer("pe", pe)
 
@@ -114,7 +115,7 @@ class MidiLikeTransformer(nn.Module):
         else:
             feature_extractor_input = x[:,:-1]
 
-        feature = self.feature_extractor(feature_extractor_input, condition) # (batch_size, num_tokens-1, hidden_dim)
+        feature = self.feature_extractor(feature_extractor_input, condition) # (batch_size, num_tokens-1, dim)
 
         if prompt is not None:
             feature = feature[:, prompt.length:]
@@ -127,18 +128,18 @@ class MidiLikeTransformer(nn.Module):
         # velocity classifier can see ground truth pitch
         velocity_logits = self.velocity_classifier(feature + self.out_pitch_emb(target.pitch)) # (batch_size, num_tokens-1, 128)
 
-        assert token_type_logits.shape == target.token_type.shape
-        assert pitch_logits.shape == target.pitch.shape
-        assert velocity_logits.shape == target.velocity.shape
+        assert token_type_logits.shape[:-1] == target.token_type.shape
+        assert pitch_logits.shape[:-1] == target.pitch.shape
+        assert velocity_logits.shape[:-1] == target.velocity.shape
 
         token_type_loss = torch.nn.functional.cross_entropy(token_type_logits.transpose(1, 2), target.token_type, ignore_index=-1, reduction="mean")
         pitch_loss = (torch.nn.functional.cross_entropy(pitch_logits.transpose(1, 2), target.pitch, ignore_index=-1, reduction="none") * target.is_note).mean()
         velocity_loss = (torch.nn.functional.cross_entropy(velocity_logits.transpose(1, 2), target.velocity, ignore_index=-1, reduction="none", label_smoothing=0.05) * target.is_note).mean()
         total_loss = token_type_loss + pitch_loss + velocity_loss
 
-        token_type_acc = (token_type_logits.detach().argmax(dim=2) == target.token_type).mean().item()
-        pitch_acc = ((pitch_logits.detach().argmax(dim=2) == target.pitch) * target.is_note).mean().item()
-        velocity_acc = ((velocity_logits.detach().argmax(dim=2) == target.velocity) * target.is_note).mean().item()
+        token_type_acc = (token_type_logits.detach().argmax(dim=2) == target.token_type).float().mean().item()
+        pitch_acc = ((pitch_logits.detach().argmax(dim=2) == target.pitch) * target.is_note).float().mean().item()
+        velocity_acc = ((velocity_logits.detach().argmax(dim=2) == target.velocity) * target.is_note).float().mean().item()
 
         return MidiLikeTransformer.Loss(
             total_loss=total_loss,
@@ -165,7 +166,7 @@ class MidiLikeTransformer(nn.Module):
 
         pbar = tqdm(range(length))
         for i in range(max_iter):
-            feature = self.feature_extractor(output) # (b=1, length, hidden_dim)
+            feature = self.feature_extractor(output) # (b=1, length, dim)
             token_type_logits = self.token_type_classifier(feature[:, -1, :])[0] # (class)
             token_type_pred = nucleus_sample(token_type_logits, 0.95) # scalar
             
@@ -288,3 +289,26 @@ def collate_fn(batch: list[Pianoroll], max_tokens: int|None=None) -> SymbolicRep
     pos_batch = pad_and_stack(pos_batch, 0)
     
     return SymbolicRepresentation(tokens_batch, token_types_batch, pos_batch)
+
+
+def collate_fn_multi(batch: list[Pianoroll], max_tokens: Sequence[int|None], slices: Sequence[slice]) -> list[SymbolicRepresentation]:
+    tokens_all: list[list[Tensor]] = [[] for _ in range(len(slices))]
+    token_types_all: list[list[Tensor]] = [[] for _ in range(len(slices))]
+    pos_all: list[list[Tensor]] = [[] for _ in range(len(slices))]
+    for pr in batch:
+        for i, (max_token, slice) in enumerate(zip(max_tokens, slices)):
+            tokens, token_types, pos = tokenize(pr.slice(slice.start, slice.stop), max_length=max_token)
+            pos = pos + slice.start
+            tokens_all[i].append(tokens)
+            token_types_all[i].append(token_types)
+            pos_all[i].append(pos)
+    
+    result: list[SymbolicRepresentation] = []
+    for i in range(len(slices)):
+        tokens_batch = pad_and_stack(tokens_all[i], 0)
+        token_types_batch = pad_and_stack(token_types_all[i], 0, pad_value=-1)
+        pos_batch = pad_and_stack(pos_all[i], 0)
+        
+        result.append(SymbolicRepresentation(tokens_batch, token_types_batch, pos_batch))
+
+    return result

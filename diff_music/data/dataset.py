@@ -18,17 +18,20 @@ class SegmentIndexer:
         return int(song_idx.item()), int(segment_idx.item())
 
 class PianorollDataset(Dataset):
-    def __init__(self, dataset_path: Path, frames_per_beat: int = 8, hop_length: int = 32, length: int = 32*8):
+    def __init__(self, dataset_path: Path, frames_per_beat: int = 8, hop_length: int = 32, length: int = 32*8, min_start_overlap: int = 32, min_end_overlap: int = 32):
         self.ds = music_data_analysis.Dataset(dataset_path)
         self.frames_per_beat = frames_per_beat
         self.hop_length = hop_length
         self.length = length
 
+        self.start_pre_pad = length - min_start_overlap
+        self.end_pre_pad = length - min_end_overlap + self.hop_length
+
         self.songs = self.ds.songs()
         self.song_n_segments = []
         for song in self.songs:
             duration: int = song.read_json('duration') * self.frames_per_beat // 64 # the duration is in 1/64 beat
-            self.song_n_segments.append((duration - self.length) // self.hop_length)
+            self.song_n_segments.append((duration - self.length + self.start_pre_pad + self.end_pre_pad) // self.hop_length)
 
         self.indexer = SegmentIndexer(self.song_n_segments)
 
@@ -42,7 +45,7 @@ class PianorollDataset(Dataset):
 
         midi = self.songs[song_idx].read_midi('synced_midi')
         pr = music_data_analysis.Pianoroll.from_midi(midi, frames_per_beat=self.frames_per_beat)
-        pr = pr.slice(segment_idx * self.hop_length, segment_idx * self.hop_length + self.length)
+        pr = pr.slice(segment_idx * self.hop_length - self.start_pre_pad, segment_idx * self.hop_length + self.length - self.start_pre_pad)
 
         return pr
         # start_time = segment_idx * self.hop_length  
