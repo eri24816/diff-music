@@ -65,8 +65,9 @@ class FeatureExtractor(nn.Module):
         dim: int
         num_layers: int
         pitch_range: list[int]
-        max_len: int
+        num_pos: int
         reduce: bool
+        condition_dim: int = 0
     
     def __init__(self, params: Params, is_causal: bool=True):
         super().__init__()
@@ -79,16 +80,24 @@ class FeatureExtractor(nn.Module):
         self.frame_emb = nn.Embedding(1, params.dim)
         self.pitch_emb = nn.Embedding(self.num_pitch, params.dim)
         self.velocity_emb = nn.Embedding(128, params.dim)
+
+        if params.condition_dim > 0:
+            self.condition_emb = nn.Linear(params.condition_dim, params.dim)
+        else:
+            self.condition_emb = None
+
         self.transformer = nn.TransformerEncoder(
             nn.TransformerEncoderLayer(params.dim, nhead=8, batch_first=True),
             num_layers=params.num_layers,
         )
-    
-        sinusoidal_pe = sinusoidal_positional_encoding(params.max_len, params.dim-5-32)
-        binary_pe = binary_positional_encoding(params.max_len, 5)
-        one_hot_pe = one_hot_positional_encoding(params.max_len, 32)
 
-        pe = torch.cat([binary_pe, one_hot_pe, sinusoidal_pe], dim=1) # (max_len, dim)
+        sinusoidal_pe = sinusoidal_positional_encoding(
+            params.num_pos, params.dim - 5 - 32
+        )
+        binary_pe = binary_positional_encoding(params.num_pos, 5)
+        one_hot_pe = one_hot_positional_encoding(params.num_pos, 32)
+
+        pe = torch.cat([binary_pe, one_hot_pe, sinusoidal_pe], dim=1)  # (max_len, dim)
         self.pe: torch.Tensor
         self.register_buffer("pe", pe)
 
@@ -97,24 +106,34 @@ class FeatureExtractor(nn.Module):
         else:
             self.out_token_emb = None
 
-    
     def to(self, device: torch.device):
         super().to(device)
         self.device = device
-    
-    def forward(self, input: SymbolicRepresentation, condition: torch.Tensor|None=None):
-        '''
-        x: SymbolicRepresentation
-        condition: (batch_size, num_tokens, dim)
+
+    def forward(
+        self, input: SymbolicRepresentation, condition: torch.Tensor | None = None
+    ):
+        """
+        x: SymbolicRepresentation (batch_size, num_tokens, ...)
+        condition: (batch_size, dim)
         returns features extracted from the input. Used for downstream classification.
         return shape: (batch_size, num_tokens, dim)
-        '''
-    
-        pe = self.pe[input.pos] # (batch_size, num_tokens, dim)
-    
-        x = input.is_note.unsqueeze(-1) * (self.pitch_emb(input.pitch) + self.velocity_emb(input.velocity)) # (batch_size, num_tokens, dim)
-        x = x + input.is_frame.unsqueeze(-1) * self.frame_emb(torch.zeros_like(input.pitch)) # (batch_size, num_tokens, dim)
-        x = x + pe # (batch_size, num_tokens, dim)
+        """
+
+        pe = self.pe[input.pos]  # (batch_size, num_tokens, dim)
+
+        x = input.is_note.unsqueeze(-1) * (
+            self.pitch_emb(input.pitch) + self.velocity_emb(input.velocity)
+        )  # (batch_size, num_tokens, dim)
+        x = x + input.is_frame.unsqueeze(-1) * self.frame_emb(
+            torch.zeros_like(input.pitch)
+        )  # (batch_size, num_tokens, dim)
+        x = x + pe  # (batch_size, num_tokens, dim)
+
+        if condition is not None:
+            condition = self.condition_emb(condition)
+            condition = condition.unsqueeze(1).expand(-1, input.length, -1)
+            x += condition
 
         if self.reduce:
             # add out token to last position
@@ -124,13 +143,18 @@ class FeatureExtractor(nn.Module):
         attn_mask = nn.Transformer.generate_square_subsequent_mask(x.shape[1]).to(x.device) if self.is_causal else None
         src_key_padding_mask = (~input.is_pad).to(x.device)
         if self.reduce:
-            src_key_padding_mask = cat_to_right(src_key_padding_mask, False, dim=1)
+            # * IMPORTANT: the key mask of the out token must be true, otherwise the output will be zero when torch.no_grad(). I believe this is a bug in pytorch.
+            src_key_padding_mask = cat_to_right(src_key_padding_mask, True, dim=1)
 
         # convert False and True to 0 and -inf.
-        src_key_padding_mask_ = torch.zeros_like(src_key_padding_mask, dtype=x.dtype, device=x.device)
-        src_key_padding_mask_[~src_key_padding_mask] = float('-inf')
+        src_key_padding_mask = src_key_padding_mask.log()
 
-        x = self.transformer(x, mask=attn_mask, src_key_padding_mask=src_key_padding_mask_, is_causal=self.is_causal) # (batch_size, num_tokens, dim)
+        x = self.transformer(
+            x,
+            mask=attn_mask,
+            src_key_padding_mask=src_key_padding_mask,
+            is_causal=self.is_causal,
+        )  # (batch_size, num_tokens, dim)
 
         if self.reduce:
             # get the last token

@@ -1,6 +1,6 @@
 from dataclasses import dataclass
 from typing import Sequence
-from music_data_analysis import Note, Pianoroll
+from music_data_analysis import Pianoroll
 import torch
 import torch.nn as nn
 from torch import Tensor
@@ -66,7 +66,8 @@ class MidiLikeTransformer(nn.Module):
         dim: int
         num_layers: int
         pitch_range: list[int]
-        max_len: int
+        num_pos: int
+        condition_dim: int = 0
 
     @dataclass
     class Loss:
@@ -80,25 +81,33 @@ class MidiLikeTransformer(nn.Module):
 
     def __init__(self, params: Params):
         super().__init__()
+        self.device = torch.device("cpu")
         self.dim = params.dim
         self.num_layers = params.num_layers
         self.pitch_range = params.pitch_range
+        self.num_pos = params.num_pos
         self.num_pitch = params.pitch_range[1] - params.pitch_range[0]
-        self.feature_extractor = FeatureExtractor(FeatureExtractor.Params(
-            dim=params.dim,
-            num_layers=params.num_layers,
-            pitch_range=params.pitch_range,
-            max_len=params.max_len,
-            reduce=False,
-        ))
+        self.feature_extractor = FeatureExtractor(
+            FeatureExtractor.Params(
+                dim=params.dim,
+                num_layers=params.num_layers,
+                pitch_range=params.pitch_range,
+                num_pos=params.num_pos,
+                reduce=False,
+                condition_dim=params.condition_dim,
+            ),
+            is_causal=True,
+        )
         self.token_type_classifier = nn.Linear(params.dim, 2)
         self.pitch_classifier = nn.Linear(params.dim, self.num_pitch)
         self.out_pitch_emb = nn.Embedding(self.num_pitch, params.dim)
         self.velocity_classifier = MLP(params.dim, 256, 128, 0)
 
-        sinusoidal_pe = sinusoidal_positional_encoding(params.max_len, params.dim-5-32)
-        binary_pe = binary_positional_encoding(params.max_len, 5)
-        one_hot_pe = one_hot_positional_encoding(params.max_len, 32)
+        sinusoidal_pe = sinusoidal_positional_encoding(
+            params.num_pos, params.dim - 5 - 32
+        )
+        binary_pe = binary_positional_encoding(params.num_pos, 5)
+        one_hot_pe = one_hot_positional_encoding(params.num_pos, 32)
 
         pe = torch.cat([binary_pe, one_hot_pe, sinusoidal_pe], dim=1) # (max_len, dim)
         self.pe: torch.Tensor
@@ -151,22 +160,38 @@ class MidiLikeTransformer(nn.Module):
             velocity_acc=velocity_acc,
         )
 
-    def sample(self, length: int, max_iter: int|None=None):
-        '''
+    @torch.no_grad()
+    def sample(
+        self,
+        duration: int,
+        max_length: int | None = None,
+        prompt: SymbolicRepresentation | None = None,
+        condition: torch.Tensor | None = None,
+    ):
+        """
         autoregressive sampling
-        length: number of frames
-        '''
+        max_pos: number of frames of the output
+        condition: (batch_size, dim)
+        """
 
-        if max_iter is None:
-            max_iter = length * 5
+        assert duration <= self.num_pos, (
+            f"max_pos must be less than or equal to {self.num_pos}"
+        )
 
-        output = SymbolicRepresentation(device=self.device)
+        if max_length is None:
+            max_length = duration * 5
 
-        current_pos = 0
+        if prompt is not None:
+            output = prompt.clone()
+            output.add_frame()
+        else:
+            output = SymbolicRepresentation(device=self.device)
 
-        pbar = tqdm(range(length))
-        for i in range(max_iter):
-            feature = self.feature_extractor(output) # (b=1, length, dim)
+        current_pos = output.duration - 1
+
+        pbar = tqdm(range(output.duration, duration))
+        for i in range(output.length, max_length):
+            feature = self.feature_extractor(output, condition)  # (b=1, length, dim)
             token_type_logits = self.token_type_classifier(feature[:, -1, :])[0] # (class)
             token_type_pred = nucleus_sample(token_type_logits, 0.95) # scalar
             
@@ -177,7 +202,7 @@ class MidiLikeTransformer(nn.Module):
 
                 pbar.update(1)
 
-                if current_pos >= length:
+                if current_pos >= duration:
                     break
 
             elif token_type_pred == self.NOTE: # note
@@ -197,30 +222,13 @@ class MidiLikeTransformer(nn.Module):
         return output
 
 
-    def sample_pianoroll(self, length: int) -> Pianoroll:
-        '''
-        length: number of frames
-        frame_rate: frames per second
-        return: pretty_midi.PrettyMIDI
-        '''
-        notes: list[Note] = []
-        result = self.sample(length)
-
-        with torch.no_grad():
-            for i in range(result.token_type.shape[0]):
-                if result.token_type[i] == self.NOTE:
-                    time = result.pos[i].item()
-                    pitch = result.token[i, 0].item()
-                    velocity = result.token[i, 1].item()
-                    assert isinstance(time, int)
-                    assert isinstance(pitch, int)
-                    assert isinstance(velocity, int)
-                    notes.append(Note(onset=time, pitch=pitch+self.pitch_range[0], velocity=velocity))
-
-        return Pianoroll(notes)
-
-
-def tokenize(pr: Pianoroll, max_length: int|None=None, pitch_range: list[int]=[21, 109], pad: bool=False):
+def tokenize(
+    pr: Pianoroll,
+    max_length: int | None = None,
+    pitch_range: list[int] = [21, 109],
+    pad: bool = False,
+    need_end_token: bool = False,
+):
     '''
     token type:
         -1: pad
@@ -244,17 +252,17 @@ def tokenize(pr: Pianoroll, max_length: int|None=None, pitch_range: list[int]=[2
         token_types.append(1)
         pos.append(note.onset)
 
-    for current_frame in range(current_frame+1, pr.duration+1):
+    for current_frame in range(current_frame + 1, pr.duration):
         tokens.append([0,0])
         token_types.append(0)
-
-        # this is a special case that logically the last pos should equal to duration  
-        # but in practice this may break the model's embedding module, so it's set to 0
-        # it's okay to do this because this entry doesn't affect the model's output
-        if current_frame == pr.duration: 
-            current_frame = 0
             
         pos.append(current_frame)
+
+    # end token is a frame token with pos 0.
+    if need_end_token:
+        tokens.append([0, 0])
+        token_types.append(0)
+        pos.append(0)
 
     if pad and max_length is not None and max_length > len(tokens):
         for _ in range(max_length - len(tokens)):
@@ -291,14 +299,24 @@ def collate_fn(batch: list[Pianoroll], max_tokens: int|None=None) -> SymbolicRep
     return SymbolicRepresentation(tokens_batch, token_types_batch, pos_batch)
 
 
-def collate_fn_multi(batch: list[Pianoroll], max_tokens: Sequence[int|None], slices: Sequence[slice]) -> list[SymbolicRepresentation]:
+def collate_fn_multi(
+    batch: list[Pianoroll],
+    max_tokens: Sequence[int | None],
+    slices: Sequence[slice],
+    need_end_token: list[bool],
+) -> list[SymbolicRepresentation]:
     tokens_all: list[list[Tensor]] = [[] for _ in range(len(slices))]
     token_types_all: list[list[Tensor]] = [[] for _ in range(len(slices))]
     pos_all: list[list[Tensor]] = [[] for _ in range(len(slices))]
     for pr in batch:
-        for i, (max_token, slice) in enumerate(zip(max_tokens, slices)):
-            tokens, token_types, pos = tokenize(pr.slice(slice.start, slice.stop), max_length=max_token)
-            pos = pos + slice.start
+        for i, (max_token, slice, need_end_token_item) in enumerate(
+            zip(max_tokens, slices, need_end_token)
+        ):
+            tokens, token_types, pos = tokenize(
+                pr.slice(slice.start, slice.stop),
+                max_length=max_token,
+                need_end_token=need_end_token_item,
+            )
             tokens_all[i].append(tokens)
             token_types_all[i].append(token_types)
             pos_all[i].append(pos)
