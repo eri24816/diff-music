@@ -148,7 +148,7 @@ class SymbolicRepresentation:
         self.pos = self.pos + shift * ~self.is_pad
         return self
 
-    def to_pianoroll(self, min_pitch: int, batch_item: int = 0):
+    def to_pianoroll(self, min_pitch: int, batch_item: int = 0) -> Pianoroll:
         notes: list[Note] = []
         for i in range(self.token_type.shape[1]):
             if self.token_type[batch_item, i] == self.NOTE:

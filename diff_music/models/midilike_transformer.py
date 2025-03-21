@@ -121,34 +121,108 @@ class MidiLikeTransformer(nn.Module):
 
         if prompt is not None:
             feature_extractor_input = prompt + x[:,:-1]
+            if condition is not None:
+                # only x needs to be conditioned
+                condition = torch.cat(
+                    [
+                        torch.zeros(
+                            condition.shape[0],
+                            prompt.length,
+                            condition.shape[1],
+                            device=condition.device,
+                        ),
+                        condition.unsqueeze(1).expand(-1, x[:, :-1].length, -1),
+                    ],
+                    dim=1,
+                )
         else:
             feature_extractor_input = x[:,:-1]
 
-        feature = self.feature_extractor(feature_extractor_input, condition) # (batch_size, num_tokens-1, dim)
+        feature = self.feature_extractor(
+            feature_extractor_input, condition
+        )  # (batch_size, num_tokens-1, dim)
 
         if prompt is not None:
-            feature = feature[:, prompt.length:]
+            feature = feature[:, prompt.length :]
 
-        target = x[:,1:] # (batch_size, num_tokens-1)
-        
-        token_type_logits = self.token_type_classifier(feature) # (batch_size, num_tokens-1, 2)
-        pitch_logits = self.pitch_classifier(feature) # (batch_size, num_tokens-1, vocab_size)
+        target = x[:, 1:]  # (batch_size, num_tokens-1)
+
+        token_type_logits = self.token_type_classifier(
+            feature
+        )  # (batch_size, num_tokens-1, 2)
+        pitch_logits = self.pitch_classifier(
+            feature
+        )  # (batch_size, num_tokens-1, vocab_size)
 
         # velocity classifier can see ground truth pitch
-        velocity_logits = self.velocity_classifier(feature + self.out_pitch_emb(target.pitch)) # (batch_size, num_tokens-1, 128)
+        velocity_logits = self.velocity_classifier(
+            feature + self.out_pitch_emb(target.pitch)
+        )  # (batch_size, num_tokens-1, 128)
 
         assert token_type_logits.shape[:-1] == target.token_type.shape
         assert pitch_logits.shape[:-1] == target.pitch.shape
         assert velocity_logits.shape[:-1] == target.velocity.shape
 
-        token_type_loss = torch.nn.functional.cross_entropy(token_type_logits.transpose(1, 2), target.token_type, ignore_index=-1, reduction="mean")
-        pitch_loss = (torch.nn.functional.cross_entropy(pitch_logits.transpose(1, 2), target.pitch, ignore_index=-1, reduction="none") * target.is_note).mean()
-        velocity_loss = (torch.nn.functional.cross_entropy(velocity_logits.transpose(1, 2), target.velocity, ignore_index=-1, reduction="none", label_smoothing=0.05) * target.is_note).mean()
+        token_type_loss = (
+            torch.nn.functional.cross_entropy(
+                token_type_logits.transpose(1, 2),
+                target.token_type,
+                ignore_index=-1,
+                reduction="none",
+            )  # (batch_size, num_tokens-1)
+            .sum(dim=1)  # sum over tokens to get -log(p(x))
+            .mean()  # average over batch
+        )
+        pitch_loss = (
+            (
+                torch.nn.functional.cross_entropy(
+                    pitch_logits.transpose(1, 2),
+                    target.pitch,
+                    ignore_index=-1,
+                    reduction="none",
+                )
+                * target.is_note
+            )
+            .sum(dim=1)
+            .mean()
+        )
+        velocity_loss = (
+            (
+                torch.nn.functional.cross_entropy(
+                    velocity_logits.transpose(1, 2),
+                    target.velocity,
+                    ignore_index=-1,
+                    reduction="none",
+                    label_smoothing=0.05,
+                )
+                * target.is_note
+            )
+            .sum(dim=1)
+            .mean()
+        )
         total_loss = token_type_loss + pitch_loss + velocity_loss
 
-        token_type_acc = (token_type_logits.detach().argmax(dim=2) == target.token_type).float().mean().item()
-        pitch_acc = ((pitch_logits.detach().argmax(dim=2) == target.pitch) * target.is_note).float().mean().item()
-        velocity_acc = ((velocity_logits.detach().argmax(dim=2) == target.velocity) * target.is_note).float().mean().item()
+        token_type_acc = (
+            (token_type_logits.detach().argmax(dim=2) == target.token_type)
+            .float()
+            .mean()
+            .item()
+        )
+        pitch_acc = (
+            ((pitch_logits.detach().argmax(dim=2) == target.pitch) * target.is_note)
+            .float()
+            .mean()
+            .item()
+        )
+        velocity_acc = (
+            (
+                (velocity_logits.detach().argmax(dim=2) == target.velocity)
+                * target.is_note
+            )
+            .float()
+            .mean()
+            .item()
+        )
 
         return MidiLikeTransformer.Loss(
             total_loss=total_loss,
@@ -190,8 +264,23 @@ class MidiLikeTransformer(nn.Module):
         current_pos = output.duration - 1
 
         pbar = tqdm(range(output.duration, duration))
+        if condition is not None:
+            prompt_length = prompt.length if prompt is not None else 0
+            # only x needs to be conditioned
+            condition_seq = torch.zeros(
+                condition.shape[0],
+                prompt_length,
+                condition.shape[1],
+                device=condition.device,
+            )
         for i in range(output.length, max_length):
-            feature = self.feature_extractor(output, condition)  # (b=1, length, dim)
+            condition_seq = torch.cat(
+                [condition_seq, condition.unsqueeze(1)],
+                dim=1,
+            )
+            feature = self.feature_extractor(
+                output, condition_seq
+            )  # (b=1, length, dim)
             token_type_logits = self.token_type_classifier(feature[:, -1, :])[0] # (class)
             token_type_pred = nucleus_sample(token_type_logits, 0.95) # scalar
             

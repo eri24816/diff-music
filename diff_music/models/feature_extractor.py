@@ -115,7 +115,7 @@ class FeatureExtractor(nn.Module):
     ):
         """
         x: SymbolicRepresentation (batch_size, num_tokens, ...)
-        condition: (batch_size, dim)
+        condition: (batch_size, length, dim)
         returns features extracted from the input. Used for downstream classification.
         return shape: (batch_size, num_tokens, dim)
         """
@@ -132,7 +132,6 @@ class FeatureExtractor(nn.Module):
 
         if condition is not None:
             condition = self.condition_emb(condition)
-            condition = condition.unsqueeze(1).expand(-1, input.length, -1)
             x += condition
 
         if self.reduce:
